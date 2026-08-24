@@ -162,7 +162,11 @@ exporting from the matching newer pytorch.
 ### Differences from the python pipeline
 
 `export_traced_model.py` measures the remaining differences against `segment_images.py`
-for the same input tile and prints them. Two are known:
+for the same input tile and prints them. Give it `--tile` to measure on real data:
+without one it verifies on random pixels, which drive the network towards a near constant
+output, and the reported fractions then say more about where that output happens to fall
+between two 8-bit levels than about the model. The comparisons over two runs of the same
+code come first, and bound what the rest can show. Two differences are known:
 
 - One pooling layer in the timm encoder derives its padding from the input size in a way
   that ties a traced graph to the size it was traced with, and is replaced by an

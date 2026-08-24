@@ -30,8 +30,9 @@ import contextlib
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Callable, Tuple
+from typing import Any, Callable, Optional, Tuple
 
+import cv2  # type: ignore
 import numpy as np
 import toml  # type: ignore
 import torch
@@ -95,6 +96,15 @@ def parse_args() -> argparse.Namespace:
         "sizes, which is verified on a second size",
     )
     parser.add_argument(
+        "-t",
+        "--tile",
+        metavar="PATH",
+        type=Path,
+        help="Image to verify on, centre cropped to --size. Random pixels by default,\n"
+        "which drive the network towards a near constant output and make the\n"
+        "reported fractions almost meaningless",
+    )
+    parser.add_argument(
         "--class_index",
         metavar="INT",
         type=int,
@@ -135,6 +145,22 @@ def autocast(conf: configurations.Configurations) -> Any:
     return torch.cuda.amp.autocast(cache_enabled=False)
 
 
+def reference_logits(
+    net: Any,
+    conf: configurations.Configurations,
+    preprocessing_fn: Callable,
+    tile: np.ndarray,
+) -> np.ndarray:
+    """The network output as `segment_images.py` obtains it, for the same input tile."""
+    image = preprocessing_fn(tile).transpose(2, 0, 1).astype("float32")
+    # The dataloader collates into a contiguous batch, and convolution results depend on
+    # the memory format
+    image = np.ascontiguousarray(image[np.newaxis])
+    with torch.no_grad(), autocast(conf):
+        batch = torch.from_numpy(image).to(conf.device)
+        return net(batch).detach().float().cpu().numpy()
+
+
 def reference_prediction(
     net: Any,
     conf: configurations.Configurations,
@@ -142,15 +168,23 @@ def reference_prediction(
     tile: np.ndarray,
 ) -> np.ndarray:
     """The prediction as `segment_images.py` computes it, for the same input tile."""
-    image = preprocessing_fn(tile).transpose(2, 0, 1).astype("float32")
-    # The dataloader collates into a contiguous batch, and convolution results depend on
-    # the memory format
-    image = np.ascontiguousarray(image[np.newaxis])
-    with torch.no_grad(), autocast(conf):
-        batch = torch.from_numpy(image).to(conf.device)
-        logits = net(batch).detach().float().cpu().numpy()
+    logits = reference_logits(net, conf, preprocessing_fn, tile)
     probability = process_utils.logit_to_prediction_np(logits)
     return np.floor(np.clip(255.0 * probability, 0.0, 255.0)).astype(np.uint8)
+
+
+def make_tile(
+    image: Optional[np.ndarray], size: Tuple[int, int], seed: int
+) -> np.ndarray:
+    """A tile of `size`, centre cropped from `image`, or random pixels without one."""
+    if image is None:
+        rng = np.random.default_rng(seed)
+        return rng.integers(0, 256, size=(size[0], size[1], 3), dtype=np.uint8)
+    assert image.shape[0] >= size[0], f"Image height below {size[0]}"
+    assert image.shape[1] >= size[1], f"Image width below {size[1]}"
+    top = (image.shape[0] - size[0]) // 2
+    left = (image.shape[1] - size[1]) // 2
+    return np.ascontiguousarray(image[top:top + size[0], left:left + size[1]])
 
 
 def compare(name: str, got: np.ndarray, want: np.ndarray) -> int:
@@ -172,21 +206,32 @@ def verify(
     net: Any,
     conf: configurations.Configurations,
     preprocessing_fn: Callable,
-    size: Tuple[int, int],
+    tile: np.ndarray,
 ) -> bool:
     """
     Check the saved graph against the wrapped network it was traced from, and against
-    the python inference pipeline.
+    the python inference pipeline. Repeated runs come first, since a difference between
+    two runs of the same code puts an upper bound on what any comparison can show.
     """
-    log.info(f"Verifying at {size[0]} x {size[1]}")
-    rng = np.random.default_rng(size[0] * size[1])
-    tile = rng.integers(0, 256, size=(size[0], size[1], 3), dtype=np.uint8)
+    log.info(f"Verifying at {tile.shape[0]} x {tile.shape[1]}")
     batch = torch.from_numpy(tile).unsqueeze(0).to(conf.device)
+
+    first = reference_logits(net, conf, preprocessing_fn, tile)
+    second = reference_logits(net, conf, preprocessing_fn, tile)
+    log.info(
+        f"{'Network logits over two runs':<44}"
+        f"largest difference {np.abs(first - second).max():.3e}"
+    )
 
     with torch.no_grad(), autocast(conf):
         expected = wrapper(batch).cpu().numpy()
+        repeated = wrapper(batch).cpu().numpy()
     with torch.no_grad(), torch.jit.optimized_execution(False):
         prediction = traced(batch).cpu().numpy()
+        prediction_repeated = traced(batch).cpu().numpy()
+
+    _ = compare("Wrapped network over two runs", repeated, expected)
+    _ = compare("Traced over two runs", prediction_repeated, prediction)
 
     ok = compare("Traced vs wrapped network", prediction, expected) == 0
     if not ok:
@@ -257,6 +302,12 @@ def export(args: argparse.Namespace) -> bool:
         parameter.requires_grad_(False)
 
     height, width = args.size
+    image = None
+    if args.tile is not None:
+        bgr = cv2.imread(str(args.tile), cv2.IMREAD_COLOR)
+        assert bgr is not None, f"Could not read {args.tile}"
+        image = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    first_tile = make_tile(image, (height, width), height * width)
     example = torch.zeros((1, height, width, 3), dtype=torch.uint8, device=conf.device)
     log.info(f"Tracing at {height} x {width}")
     with torch.no_grad(), autocast(conf):
@@ -281,10 +332,11 @@ def export(args: argparse.Namespace) -> bool:
     log.info(f"Wrote traced model to {args.output}")
 
     loaded = torch.jit.load(str(args.output), map_location=conf.device)
-    ok = verify(loaded, wrapper, net, conf, preprocessing_fn, (height, width))
+    ok = verify(loaded, wrapper, net, conf, preprocessing_fn, first_tile)
     # A scan has tiles of several sizes, so the graph must not be tied to the traced one
     second_size = (height - conf.min_divisor, width - 2 * conf.min_divisor)
-    ok = verify(loaded, wrapper, net, conf, preprocessing_fn, second_size) and ok
+    second_tile = make_tile(image, second_size, second_size[0] * second_size[1])
+    ok = verify(loaded, wrapper, net, conf, preprocessing_fn, second_tile) and ok
     return ok
 
 
