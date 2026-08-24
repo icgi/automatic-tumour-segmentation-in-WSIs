@@ -216,6 +216,14 @@ def verify(
     log.info(f"Verifying at {tile.shape[0]} x {tile.shape[1]}")
     batch = torch.from_numpy(tile).unsqueeze(0).to(conf.device)
 
+    # cuDNN takes the first convolution algorithm whose workspace fits in the memory
+    # free at the time of the call. Each path is run once before being compared, to
+    # compare them in the state that a run over many tiles settles into.
+    with torch.no_grad(), autocast(conf):
+        _ = wrapper(batch)
+    with torch.no_grad(), torch.jit.optimized_execution(False):
+        _ = traced(batch)
+
     first = reference_logits(net, conf, preprocessing_fn, tile)
     second = reference_logits(net, conf, preprocessing_fn, tile)
     log.info(
