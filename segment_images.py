@@ -14,7 +14,6 @@ import cv2  # type: ignore
 import numpy as np
 import pandas as pd  # type: ignore
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.joinpath("process", "src")))
@@ -474,20 +473,7 @@ def segment_images(conf: configurations.Configurations):
 
     amp_autocast = torch.cuda.amp.autocast if conf.amp else suppress
 
-    net = network.select(conf).to(conf.device)
-    if conf.num_gpus > 1:
-        net = nn.DataParallel(net)
-
-    state = torch.load(conf.restore_path, map_location="cpu")
-    state_key = "network_state"
-    if conf.ema:
-        state_key += "_ema"
-    net_state = process_utils.maybe_remove_module_prefix(state[state_key])
-    if conf.restore_universal_to_non_universal:
-        net_state = process_utils.from_timm_universal(net_state)
-    net.load_state_dict(net_state)
-
-    net.eval()
+    net = network.load(conf)
     process_utils.network_summary(
         conf.log_dir,
         net,

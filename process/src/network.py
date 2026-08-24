@@ -15,6 +15,25 @@ from deeplabv3plus_stdconv.model import DeepLabV3PlusStdConv
 log = logging.getLogger("network")
 
 
+def load(conf: configurations.Configurations) -> Any:
+    """Build the network, restore weights from `conf.restore_path`, set eval mode."""
+    net = select(conf).to(conf.device)
+    if conf.num_gpus > 1:
+        net = torch.nn.DataParallel(net)
+
+    state = torch.load(conf.restore_path, map_location="cpu")
+    state_key = "network_state"
+    if conf.ema:
+        state_key += "_ema"
+    net_state = utils.maybe_remove_module_prefix(state[state_key])
+    if conf.restore_universal_to_non_universal:
+        net_state = utils.from_timm_universal(net_state)
+    net.load_state_dict(net_state)
+
+    net.eval()
+    return net
+
+
 def select(conf: configurations.Configurations) -> Any:
     """
     See https://github.com/qubvel/segmentation_models.pytorch for available encoders and
