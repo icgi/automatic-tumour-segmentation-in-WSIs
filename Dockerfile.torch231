@@ -1,0 +1,19 @@
+# For checking the export against a newer pytorch than the root Dockerfile pins. The
+# python packages are the same, so that the torch version is the only difference. Only
+# what export_traced_model.py needs is installed, not the rest of the pipeline.
+
+FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
+
+WORKDIR /workdir
+
+COPY . .
+
+RUN python -m pip install --upgrade pip && python -m pip install --no-cache-dir \
+    "numpy<2" \
+    pandas==1.4.1 \
+    opencv_python_headless==4.5.5.64 \
+    albumentations==1.1.0 \
+    timm==0.4.12 \
+    segmentation_models_pytorch==0.2.1 \
+    torchinfo==1.6.3 \
+    toml==0.10.2

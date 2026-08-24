@@ -157,7 +157,8 @@ kernel runs: the libtorch version must match the pytorch version used to export 
 `Dockerfile`), the GPU must be the same model, and the cuDNN benchmark and TF32 settings
 must be left at their defaults on both sides. A traced archive does load in a later
 libtorch than it was written with, but its results move, so a newer libtorch means
-exporting from the matching newer pytorch.
+exporting from the matching newer pytorch. `Dockerfile.torch231` builds the same python
+packages on pytorch 2.3.1 for that purpose.
 
 ### Differences from the python pipeline
 
