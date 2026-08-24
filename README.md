@@ -89,3 +89,89 @@ cargo build --release
 
 Inference with the tile size used for the published model (7680 x 7680) requires a GPU
 with minimum 24 GB memory.
+
+## Inference from c++ with libtorch
+
+`export_traced_model.py` traces a trained model with `torch.jit` and saves it as a
+TorchScript archive that can be loaded from libtorch.
+
+```
+$ python export_traced_model.py --config process/config/inference.toml \
+    --restore /path/to/model.tar --output /path/to/model.pt
+```
+
+The traced module is the whole tile computation, not only the network:
+
+- Input is a uint8 tensor `(N, H, W, 3)` with RGB channel order, as tiles are read from
+  disk. Normalisation is part of the graph.
+- Output is a uint8 tensor `(N, C, H, W)` with one probability map per class in the order
+  given by `classes` in the config, scaled to `[0, 255]`. Softmax and 8-bit quantisation
+  are part of the graph. `--class_index -1` returns `(N, 1, H, W)` with only the class
+  that the merging step reads. Softmax normalises over the classes, so this reduces the
+  output and the operations after it, not the cost of the network.
+
+Nothing therefore has to be reimplemented in c++, which is what makes results agree.
+The exported graph accepts any input size divisible by `min_divisor`, so a scan's edge
+tiles need no separate export.
+
+### Mixed precision
+
+The graph is traced inside the same autocast context that `segment_images.py` uses. The
+tracer records the casts that autocast inserted as ordinary operations, so the saved
+graph is an explicit mixed-precision graph. Run it *without* autocast in c++.
+
+Two settings decide whether results are reproducible, and `export_traced_model.py`
+reports on both:
+
+- Tracing requires the autocast weight cache to be off, and requires parameters not to
+  require gradients. A cached cast is not recorded in the graph, and the tracer then
+  either stores a stale constant or fails outright with `Cannot insert a Tensor that
+  requires grad as a constant`.
+- Running requires graph executor optimisation to be off. Fusing operations changes the
+  order of arithmetic, and in half precision that changes the result. The optimiser only
+  kicks in from the third call onwards, so a single test call will not reveal it.
+
+```cpp
+#include <torch/csrc/jit/runtime/graph_executor.h>
+
+torch::jit::setGraphExecutorOptimize(false);
+auto module = torch::jit::load("/path/to/model.pt", torch::kCUDA);
+module.eval();
+
+torch::NoGradGuard no_grad;
+// tile is an OpenCV CV_8UC3 image in RGB order
+auto input = torch::from_blob(tile.data, {1, tile.rows, tile.cols, 3}, torch::kUInt8)
+                 .to(torch::kCUDA);
+auto output = module.forward({input}).toTensor().to(torch::kCPU);
+```
+
+Do not call `torch::jit::freeze` or `optimize_for_inference` on the module. Both fold
+and rewrite operations, which changes results in half precision.
+
+The graph refers to no device, so loading it with a device and placing the input on the
+same device is all that is needed to run on cpu or cuda. It cannot run on MPS, which does
+not support float64: both moving the module there and the normalisation fail.
+
+Results are identical only between builds that agree on everything that decides which
+kernel runs: the libtorch version must match the pytorch version used to export (see the
+`Dockerfile`), the GPU must be the same model, and the cuDNN benchmark and TF32 settings
+must be left at their defaults on both sides. A traced archive does load in a later
+libtorch than it was written with, but its results move, so a newer libtorch means
+exporting from the matching newer pytorch.
+
+### Differences from the python pipeline
+
+`export_traced_model.py` measures the remaining differences against `segment_images.py`
+for the same input tile and prints them. Two are known:
+
+- One pooling layer in the timm encoder derives its padding from the input size in a way
+  that ties a traced graph to the size it was traced with, and is replaced by an
+  equivalent layer with fixed padding. See `replace_dynamic_padding` in
+  `process/src/traced_model.py`.
+- Softmax runs on the GPU rather than in scipy on the cpu, which can put the 8-bit
+  probability of a pixel one level off.
+
+Tracing prints warnings about converting tensors to python booleans and about tensors
+registered as constants. Both come from size-independent code, the first from the check
+on batch size inside `torch.nn.functional.batch_norm` that weight standardisation runs
+into, the second from the placeholder features in `process/src/timm_nfnet_encoder.py`.
