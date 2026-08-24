@@ -174,6 +174,13 @@ code come first, and bound what the rest can show. Two differences are known:
   `process/src/traced_model.py`.
 - Softmax runs on the GPU rather than in scipy on the cpu, which can put the 8-bit
   probability of a pixel one level off.
+- Writing the model out and reading it back does not preserve values on cuda in torch
+  1.11. The archive differs from the model it was traced from by up to one 8-bit level,
+  on a share of the tissue that depends on the input size and is largest at the size the
+  model was traced with. Weights, buffers, constants and the sequence of operations all
+  survive the round trip unchanged, and the difference is one step of the half precision
+  logits. This is between the archive and the eager python pipeline: the archive itself
+  is self consistent, so c++ and python runs of it agree with each other.
 
 Tracing prints warnings about converting tensors to python booleans and about tensors
 registered as constants. Both come from size-independent code, the first from the check
