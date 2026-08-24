@@ -93,7 +93,7 @@ class TileSegmentation(nn.Module):
             x[:, channel].copy_(values)
         return x
 
-    def forward(self, image: torch.Tensor) -> torch.Tensor:
+    def probability(self, image: torch.Tensor) -> torch.Tensor:
         logits = self.net(self.normalise(image))
         # Softmax normalises over the classes, so all of them are computed even when
         # one probability map is returned. Selecting before exp keeps log_softmax
@@ -102,8 +102,26 @@ class TileSegmentation(nn.Module):
         if self.class_index is not None:
             log_probability = log_probability[:, self.class_index].unsqueeze(1)
         # In place from here, log_softmax being the last operation needing a tensor
-        probability = log_probability.exp_()
+        return log_probability.exp_()
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        probability = self.probability(image)
         return probability.mul_(255.0).clamp_(0.0, 255.0).floor_().to(torch.uint8)
+
+
+class TileProbability(nn.Module):
+    """
+    `TileSegmentation` without the 8-bit quantisation. Differences below half a level
+    are invisible in the quantised output on a tile of background, and a large part of
+    the tile on one with tissue, so measuring them needs the unquantised values.
+    """
+
+    def __init__(self, segmentation: TileSegmentation):
+        super().__init__()
+        self.segmentation = segmentation
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        return self.segmentation.probability(image)
 
 
 def self_check():

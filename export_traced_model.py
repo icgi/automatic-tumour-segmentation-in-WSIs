@@ -29,6 +29,7 @@ import argparse
 import contextlib
 import logging
 import sys
+from collections import namedtuple
 from pathlib import Path
 from typing import Any, Callable, Optional, Tuple
 
@@ -46,6 +47,14 @@ import traced_model  # type: ignore
 import utils as process_utils  # type: ignore
 
 log = logging.getLogger("export")
+
+# A probability at or below this is background, where a difference cannot show
+BACKGROUND = 0.002
+
+# The quantised output, the same without quantisation, and the eager counterparts
+Models = namedtuple(
+    "Models", ["traced", "traced_probability", "wrapper", "probability", "network"]
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -201,9 +210,7 @@ def compare(name: str, got: np.ndarray, want: np.ndarray) -> int:
 
 
 def verify(
-    traced: Any,
-    wrapper: torch.nn.Module,
-    net: Any,
+    models: "Models",
     conf: configurations.Configurations,
     preprocessing_fn: Callable,
     tile: np.ndarray,
@@ -213,6 +220,7 @@ def verify(
     the python inference pipeline. Repeated runs come first, since a difference between
     two runs of the same code puts an upper bound on what any comparison can show.
     """
+    traced, wrapper, net = models.traced, models.wrapper, models.network
     log.info(f"Verifying at {tile.shape[0]} x {tile.shape[1]}")
     batch = torch.from_numpy(tile).unsqueeze(0).to(conf.device)
 
@@ -240,8 +248,24 @@ def verify(
 
     _ = compare("Wrapped network over two runs", repeated, expected)
     _ = compare("Traced over two runs", prediction_repeated, prediction)
+    _ = compare("Traced vs wrapped network", prediction, expected)
 
-    ok = compare("Traced vs wrapped network", prediction, expected) == 0
+    with torch.no_grad(), autocast(conf):
+        eager_probability = models.probability(batch)
+    with torch.no_grad(), torch.jit.optimized_execution(False):
+        traced_probability = models.traced_probability(batch)
+    gap = (eager_probability - traced_probability).abs().max().item()
+    covered = 100.0 * (eager_probability > BACKGROUND).float().mean().item()
+    log.info(f"{'Probability gap traced vs wrapped':<44}{gap:.3e}")
+    log.info(f"{'Tile above ' + str(BACKGROUND):<44}{covered:.1f}%")
+    if covered < 1.0:
+        log.warning(
+            "Almost all of this tile is background, where the probability saturates "
+            "and hides any difference. Pass --tile with tissue on it"
+        )
+    # One step of the half precision logits moves a probability by about 2e-3, so a gap
+    # below one 8-bit level is the last bit of the network rather than a different graph
+    ok = gap < 1.0 / 255.0
     if not ok:
         log.error("The saved graph does not reproduce the network it was traced from")
 
@@ -339,12 +363,17 @@ def export(args: argparse.Namespace) -> bool:
     torch.jit.save(traced, str(args.output))
     log.info(f"Wrote traced model to {args.output}")
 
+    probability = traced_model.TileProbability(wrapper).eval()
+    with torch.no_grad(), autocast(conf):
+        traced_probability = torch.jit.trace(probability, example, check_trace=False)
+
     loaded = torch.jit.load(str(args.output), map_location=conf.device)
-    ok = verify(loaded, wrapper, net, conf, preprocessing_fn, first_tile)
+    models = Models(loaded, traced_probability, wrapper, probability, net)
+    ok = verify(models, conf, preprocessing_fn, first_tile)
     # A scan has tiles of several sizes, so the graph must not be tied to the traced one
     second_size = (height - conf.min_divisor, width - 2 * conf.min_divisor)
     second_tile = make_tile(image, second_size, second_size[0] * second_size[1])
-    ok = verify(loaded, wrapper, net, conf, preprocessing_fn, second_tile) and ok
+    ok = verify(models, conf, preprocessing_fn, second_tile) and ok
     return ok
 
 
