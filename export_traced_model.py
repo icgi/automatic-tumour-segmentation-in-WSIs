@@ -27,6 +27,7 @@ Example:
 
 import argparse
 import contextlib
+import io
 import logging
 import sys
 from collections import namedtuple
@@ -366,6 +367,11 @@ def export(args: argparse.Namespace) -> bool:
     probability = traced_model.TileProbability(wrapper).eval()
     with torch.no_grad(), autocast(conf):
         traced_probability = torch.jit.trace(probability, example, check_trace=False)
+    # Through the same round trip as the saved model, which is not value preserving
+    buffer = io.BytesIO()
+    torch.jit.save(traced_probability, buffer)
+    buffer.seek(0)
+    traced_probability = torch.jit.load(buffer, map_location=conf.device)
 
     loaded = torch.jit.load(str(args.output), map_location=conf.device)
     models = Models(loaded, traced_probability, wrapper, probability, net)
