@@ -255,9 +255,14 @@ def verify(
         eager_probability = models.probability(batch)
     with torch.no_grad(), torch.jit.optimized_execution(False):
         traced_probability = models.traced_probability(batch)
-    gap = (eager_probability - traced_probability).abs().max().item()
+    difference = (eager_probability - traced_probability).abs()
+    gap = difference.max().item()
+    share = 100.0 * (difference > 0).float().mean().item()
     covered = 100.0 * (eager_probability > BACKGROUND).float().mean().item()
-    log.info(f"{'Probability gap traced vs wrapped':<44}{gap:.3e}")
+    log.info(
+        f"{'Probability gap traced vs wrapped':<44}{gap:.3e} "
+        f"on {share:.3f}% of the tile"
+    )
     log.info(f"{'Tile above ' + str(BACKGROUND):<44}{covered:.1f}%")
     if covered < 1.0:
         log.warning(
