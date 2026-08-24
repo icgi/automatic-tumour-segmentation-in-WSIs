@@ -8,7 +8,7 @@ import torch
 import albumentations as albu
 import cv2
 import torchinfo
-import scipy
+import scipy.special
 
 log = logging.getLogger("utils")
 
