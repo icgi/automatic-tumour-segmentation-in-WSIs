@@ -326,9 +326,16 @@ def export(args: argparse.Namespace) -> bool:
     traceable = network.load(conf)
     replaced = traced_model.replace_dynamic_padding(traceable)
     log.info(f"Replaced {replaced} pooling layer(s) with fixed padding")
-    wrapper = traced_model.TileSegmentation(
-        traceable, settings["mean"], settings["std"], args.class_index
-    ).eval()
+    # Onto the device before tracing. The mean and std buffers are created on the cpu,
+    # and a scalar held there is dispatched differently from one held on a gpu, so
+    # tracing with them on the cpu records operands that loading the model then changes.
+    wrapper = (
+        traced_model.TileSegmentation(
+            traceable, settings["mean"], settings["std"], args.class_index
+        )
+        .to(conf.device)
+        .eval()
+    )
     # Parameters that require grad are cast through the autocast cache, which hides the
     # cast from the tracer
     for parameter in wrapper.parameters():
